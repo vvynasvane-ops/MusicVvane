@@ -11,7 +11,7 @@
    IndexedDB — delegated to shared.js (VV) so index/video/recap pages
    never open the database at different versions and block each other.
    --------------------------------------------------------------------- */
-const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbPut } = window.VV;
+const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut } = window.VV;
 
 /* ---------------------------------------------------------------------
    State
@@ -46,6 +46,7 @@ const state = {
   fileRefs: new Map(),   // songId -> File or FileSystemFileHandle
   objectUrl: null,
   artCache: new Map(),   // unused (kept for backward compat with any external references)
+  customArt: new Map(),  // songId -> custom album art data URL (uploaded from device), see loadUserData
 };
 
 const audio = new Audio();
@@ -98,6 +99,9 @@ const els = {
   playerCollapseBtn: $("#playerCollapseBtn"),
   playerQueueTopBtn: $("#playerQueueTopBtn"),
   playerArt: $("#playerArt"),
+  editArtBtn: $("#editArtBtn"),
+  resetArtBtn: $("#resetArtBtn"),
+  albumArtUploadInput: $("#albumArtUploadInput"),
   playerTitle: $("#playerTitle"),
   playerArtist: $("#playerArtist"),
   playerSourceLabel: $("#playerSourceLabel"),
@@ -183,13 +187,16 @@ function titleCaseFromFilename(name) {
 }
 
 /* Album art rendering — delegates to window.VV.generatedArt (shared.js)
-   so it always reflects the currently selected Album Art Style. This used
-   to have its own local sigil-only generator + cache here that ignored
-   Settings → Album Art Style entirely (the art never updated when you
-   picked a different style); that duplicate has been removed so this is
-   now the single source of truth, same as the rest of the app. */
+   so it always reflects the currently selected Album Art Style, unless
+   the song has a custom photo uploaded from device storage (Settings-
+   free — set via the full player's edit-art button), in which case that
+   always takes priority. This used to have its own local sigil-only
+   generator + cache here that ignored Settings → Album Art Style
+   entirely (the art never updated when you picked a different style);
+   that duplicate has been removed so this is now the single source of
+   truth, same as the rest of the app. */
 function artHtml(song, sizeAttr = "") {
-  const url = window.VV.generatedArt(song.title + song.artist + song.id, 160);
+  const url = state.customArt.get(song.id) || window.VV.generatedArt(song.title + song.artist + song.id, 160);
   return `<img src="${url}" alt="" loading="lazy">`;
 }
 
@@ -282,7 +289,7 @@ const RAGE_BACKGROUNDS = [
    just the in-memory object URL created from that Blob for the current
    page load, revoked and recreated whenever the photo changes. Selecting
    it sets state.settings.rageBackground = "custom", same as any preset. */
-const CUSTOM_BG_MAX_BYTES = 8 * 1024 * 1024; // 8MB — keeps IndexedDB snappy
+const CUSTOM_BG_MAX_BYTES = 8 * 1024 * 1024; // 8MB cap for user-uploaded photos (background image + custom album art) — keeps IndexedDB snappy
 let customBgObjectUrl = null;
 
 /* ---------------------------------------------------------------------
@@ -903,7 +910,7 @@ function finishOnboarding() {
    Persisted user data: playlists / favorites / play counts / settings
    --------------------------------------------------------------------- */
 async function loadUserData() {
-  const [playlists, favKeys, pcEntries, settings, recent, customBgBlob] = await Promise.all([
+  const [playlists, favKeys, pcEntries, settings, recent, customBgBlob, customArtEntries] = await Promise.all([
     idbGetAll("playlists"),
     idbGetAllKeys("favorites"),
     (async () => {
@@ -923,11 +930,13 @@ async function loadUserData() {
     idbGet("kv", "settings"),
     idbGet("kv", "recentlyPlayed"),
     idbGet("kv", "customBgImage"),
+    idbGetAllEntries("customArt"),
   ]);
   state.playlists = playlists || [];
   state.favorites = new Set(favKeys || []);
   state.playCounts = new Map(pcEntries || []);
   state.recentlyPlayed = recent || [];
+  state.customArt = new Map(customArtEntries || []);
   // Re-derive an object URL for the uploaded background photo, if any —
   // object URLs don't survive a page reload, but the Blob behind it does.
   if (customBgBlob) {
@@ -1380,7 +1389,15 @@ function syncNowPlayingUI(song) {
   els.playerArtist.textContent = song.artist;
   els.playerSourceLabel.textContent = song.album || "Now Playing";
   syncPlayerFavIcon();
+  syncPlayerArtButtons(song);
   setPlayIcon(state.isPlaying);
+}
+/** Shows the "reset to default art" button only when the currently
+ *  playing song has a custom photo uploaded; the edit (pencil) button
+ *  is always visible so a photo can be added or replaced any time. */
+function syncPlayerArtButtons(song) {
+  if (!els.resetArtBtn) return;
+  els.resetArtBtn.classList.toggle("hidden", !state.customArt.has(song.id));
 }
 function syncPlayerFavIcon() {
   const songId = state.queue[state.queueIndex];
@@ -1483,9 +1500,11 @@ window.addEventListener("pointerup", () => { seeking = false; });
 /* Media Session — lock screen / notification controls */
 function updateMediaSession(song) {
   if (!("mediaSession" in navigator)) return;
+  const custom = state.customArt.get(song.id);
+  const art = custom || window.VV.generatedArt(song.title + song.artist + song.id, 512);
   navigator.mediaSession.metadata = new MediaMetadata({
     title: song.title, artist: song.artist, album: song.album || "Vvynas Vane",
-    artwork: [{ src: window.VV.generatedArt(song.title + song.artist + song.id, 512), sizes: "512x512", type: "image/png" }],
+    artwork: [{ src: art, sizes: "512x512", type: custom ? "image/jpeg" : "image/png" }],
   });
   navigator.mediaSession.setActionHandler("play", togglePlay);
   navigator.mediaSession.setActionHandler("pause", togglePlay);
@@ -1989,6 +2008,46 @@ els.repeatBtn.addEventListener("click", cycleRepeat);
 els.favBtn.addEventListener("click", () => { const id = state.queue[state.queueIndex]; if (id) toggleFavorite(id); });
 els.addToPlaylistBtn.addEventListener("click", () => { const id = state.queue[state.queueIndex]; if (id) openPlaylistModal(id); });
 els.queueBtn.addEventListener("click", openQueue);
+
+/* Custom album art — pick a photo from device storage for the song
+   currently open in the full player. Any resolution/aspect ratio goes
+   in; resizeImageFileToDataUrl (shared.js) normalizes it into a square
+   512x512 JPEG so it's compatible everywhere art is shown. */
+els.editArtBtn.addEventListener("click", () => {
+  const id = state.queue[state.queueIndex];
+  if (!id) { toast("Nothing playing yet."); return; }
+  els.albumArtUploadInput.click();
+});
+els.albumArtUploadInput.addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ""; // reset so picking the same file again still fires "change"
+  if (!file) return;
+  const songId = state.queue[state.queueIndex];
+  if (!songId) return;
+  if (!file.type.startsWith("image/")) { toast("Please choose an image file."); return; }
+  if (file.size > CUSTOM_BG_MAX_BYTES) { toast("That image is too large — please pick one under 8MB."); return; }
+  try {
+    const dataUrl = await window.VV.resizeImageFileToDataUrl(file, 512, 0.86);
+    await idbSet("customArt", songId, dataUrl);
+    state.customArt.set(songId, dataUrl);
+    const song = state.songs.find(s => s.id === songId);
+    if (song) { syncNowPlayingUI(song); updateMediaSession(song); }
+    render(); // library rows / playlists picking up the new art
+    toast("Album art updated.");
+  } catch {
+    toast("Couldn't read that image — try a different file.");
+  }
+});
+els.resetArtBtn.addEventListener("click", async () => {
+  const songId = state.queue[state.queueIndex];
+  if (!songId || !state.customArt.has(songId)) return;
+  await idbDelete("customArt", songId);
+  state.customArt.delete(songId);
+  const song = state.songs.find(s => s.id === songId);
+  if (song) { syncNowPlayingUI(song); updateMediaSession(song); }
+  render();
+  toast("Album art reset to default.");
+});
 
 els.closeQueueBtn.addEventListener("click", closeQueue);
 els.sheetOverlay.addEventListener("click", closeQueue);

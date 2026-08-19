@@ -11,7 +11,7 @@
    IndexedDB — shared store across every page
    --------------------------------------------------------------------- */
 const DB_NAME = "vvynas-vane-db";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 let dbPromise = null;
 function openDB() {
   if (dbPromise) return dbPromise;
@@ -25,6 +25,10 @@ function openDB() {
       if (!db.objectStoreNames.contains("playCounts")) db.createObjectStore("playCounts");
       if (!db.objectStoreNames.contains("monthStats")) db.createObjectStore("monthStats");
       if (!db.objectStoreNames.contains("djPlayCounts")) db.createObjectStore("djPlayCounts");
+      // Per-song custom album art (Settings-free — set from the full
+      // player's edit-art button). Key: song id. Value: a resized JPEG
+      // data URL produced by resizeImageFileToDataUrl below.
+      if (!db.objectStoreNames.contains("customArt")) db.createObjectStore("customArt");
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -51,9 +55,60 @@ async function idbGetAllKeys(store) {
   const db = await openDB();
   return new Promise((res, rej) => { const tx = db.transaction(store, "readonly"); const r = tx.objectStore(store).getAllKeys(); r.onsuccess = () => res(r.result || []); r.onerror = () => rej(r.error); });
 }
+async function idbGetAllEntries(store) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(store, "readonly");
+    const objStore = tx.objectStore(store);
+    const out = [];
+    const req = objStore.openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (cur) { out.push([cur.key, cur.value]); cur.continue(); } else res(out);
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
 async function idbPut(store, obj) {
   const db = await openDB();
   return new Promise((res, rej) => { const tx = db.transaction(store, "readwrite"); tx.objectStore(store).put(obj); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); });
+}
+
+/* ---------------------------------------------------------------------
+   Custom album art — takes a photo picked from device storage, at
+   *any* resolution or aspect ratio, and normalizes it into a fixed
+   512x512 JPEG data URL. Center-crops to a square first (like CSS
+   object-fit: cover) so nothing gets stretched or letterboxed, then
+   downscales, so the result is a consistent size/format that drops
+   into every art call site — library rows, mini-player, full player,
+   lock-screen artwork — exactly like generatedArt()'s output does.
+   --------------------------------------------------------------------- */
+async function loadImageBitmapFromFile(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file); } catch { /* fall through to <img> path below */ }
+  }
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = (err) => { URL.revokeObjectURL(url); reject(err); };
+    img.src = url;
+  });
+}
+async function resizeImageFileToDataUrl(file, size = 512, quality = 0.86) {
+  const bitmap = await loadImageBitmapFromFile(file);
+  try {
+    const srcW = bitmap.width, srcH = bitmap.height;
+    const cropSize = Math.min(srcW, srcH);
+    const sx = (srcW - cropSize) / 2, sy = (srcH - cropSize) / 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, sx, sy, cropSize, cropSize, 0, 0, size, size);
+    return canvas.toDataURL("image/jpeg", quality);
+  } finally {
+    if (bitmap.close) bitmap.close(); // only ImageBitmap has this, not the <img> fallback
+  }
 }
 
 /* ---------------------------------------------------------------------
@@ -1324,12 +1379,13 @@ const GlobeTitle = (function () {
    Public export
    --------------------------------------------------------------------- */
 global.VV = {
-  idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbPut,
+  idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut,
   FONTS, applyFont,
   fsApiSupported, verifyPermission, pickDirectory, getStoredHandle, walkDirectory,
   ThemeEngine, PixieDust, BookTransition, GlobeTitle,
   C, linGrad, radGrad, fillGrad,
   generatedArt, hashStr, setArtStyle, getArtStyle, ART_STYLES, drawSkullIcon,
+  resizeImageFileToDataUrl,
 };
 
 })(window);

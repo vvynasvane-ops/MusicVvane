@@ -57,6 +57,16 @@ python3 -m http.server 8080
   `shared.js`; it now always goes through the shared generator, so style
   changes apply immediately everywhere (library rows, mini-player, full
   player, lock-screen artwork).
+- **Custom album art per song** (full player → pencil icon on the
+  artwork): pick a photo straight from device storage to use as that
+  song's cover instead of the generated art. Any size or aspect ratio
+  goes in — it's automatically center-cropped to a square and resized to
+  512x512 so it displays correctly and consistently everywhere art shows
+  up (library rows, mini-player, full player, lock-screen controls),
+  same as the generated styles above. Stored on-device (IndexedDB), so
+  it's still there next time you open the app; a second button next to
+  the pencil resets a song back to its generated art. 8MB cap per photo,
+  nothing ever leaves your device.
 - **Monthly & yearly recap**, **video player** with subtitles/multi-
   language audio, and **DJ Mode** — see the sections below.
 
@@ -147,5 +157,6 @@ an automatic English preference and an AUD picker.
 
 ## Still simplified
 
-The lyrics view and ID3-embedded album art (this still uses generated
-art) aren't in this pass.
+The lyrics view and automatic ID3-embedded album art extraction aren't
+in this pass — songs still default to generated art unless you manually
+upload a photo per-song (see "Custom album art per song" above).
