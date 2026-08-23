@@ -161,6 +161,9 @@
         <button class="icon-btn" id="shuffleAllBtn" title="Shuffle play all">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h4l9 16h3M4 20h4l3-5.2M17 4h3v3M14 8.5L17 4M17 20v-3l3 0"/></svg>
         </button>
+        <button class="icon-btn" id="homeCarouselBtn" title="Change background theme">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="6" width="6" height="12" rx="1"/><rect x="9" y="3" width="6" height="18" rx="1"/><rect x="15" y="6" width="6" height="12" rx="1"/></svg>
+        </button>
       </header>
 
       <div class="content-scroll" id="contentScroll">
@@ -360,6 +363,14 @@
         <input type="range" id="overlayStrengthInput" min="0" max="100" step="5" value="55">
         <span class="overlay-strength-icon" title="Song details fully shielded">◆</span>
         <span class="overlay-strength-value" id="overlayStrengthValue">55%</span>
+      </div>
+
+      <div class="section-label" style="margin-top:16px;">Song List Darkness <span style="color:var(--text-muted);font-size:10.5px;">(dims the background behind your library list)</span></div>
+      <div class="overlay-strength-row">
+        <span class="overlay-strength-icon" title="Background fully visible">☾</span>
+        <input type="range" id="songListOverlayInput" min="0" max="100" step="5" value="40">
+        <span class="overlay-strength-icon" title="Song list panel near-black">◆</span>
+        <span class="overlay-strength-value" id="songListOverlayValue">40%</span>
       </div>
 
       <div class="modal-actions">

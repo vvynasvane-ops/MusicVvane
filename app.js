@@ -45,7 +45,7 @@ const state = {
   repeat: "off",         // off | all | one
   isPlaying: false,
   addToPlaylistTargetId: null,
-  settings: { light: false, resume: true, fontStyle: 0, themeId: "none", accentColor: "#C9A84C", accent2Color: "#B22222", artStyle: "sigil", rageMode: false, rageBackground: "none", rageDripType: "smoke", overlayStrength: 55 },
+  settings: { light: false, resume: true, fontStyle: 0, themeId: "none", accentColor: "#C9A84C", accent2Color: "#B22222", artStyle: "sigil", rageMode: false, rageBackground: "none", rageDripType: "smoke", overlayStrength: 55, songListOverlay: 40 },
   usingFSApi: false,
   fileRefs: new Map(),   // songId -> File or FileSystemFileHandle
   objectUrl: null,
@@ -152,11 +152,14 @@ const els = {
   settingsRescanBtn: $("#settingsRescanBtn"),
   overlayStrengthInput: $("#overlayStrengthInput"),
   overlayStrengthValue: $("#overlayStrengthValue"),
+  songListOverlayInput: $("#songListOverlayInput"),
+  songListOverlayValue: $("#songListOverlayValue"),
 
   iosModalOverlay: $("#iosModalOverlay"),
   closeIosModalBtn: $("#closeIosModalBtn"),
 
   openThemeCarouselBtn: $("#openThemeCarouselBtn"),
+  homeCarouselBtn: $("#homeCarouselBtn"),
   themeCarouselOverlay: $("#themeCarouselOverlay"),
   tcTrack: $("#tcTrack"),
   tcPrevBtn: $("#tcPrevBtn"),
@@ -1767,6 +1770,7 @@ function applySettingsToUI() {
   applyRageDripType();
   applyThemeVideo();
   applyOverlayStrength();
+  applySongListOverlay();
   RageMode.setActive(state.settings.rageMode);
   renderFontGrid();
   renderThemeGrid();
@@ -2078,6 +2082,7 @@ function closeThemeCarousel(commit) {
   els.themeCarouselOverlay.classList.remove("open");
 }
 els.openThemeCarouselBtn.addEventListener("click", openThemeCarousel);
+els.homeCarouselBtn.addEventListener("click", openThemeCarousel);
 els.tcCloseBtn.addEventListener("click", () => closeThemeCarousel(false));
 els.themeCarouselOverlay.addEventListener("click", (e) => { if (e.target === els.themeCarouselOverlay) closeThemeCarousel(false); });
 els.tcConfirmBtn.addEventListener("click", () => closeThemeCarousel(true));
@@ -2120,14 +2125,44 @@ function applyOverlayStrength() {
   const v = state.settings.overlayStrength ?? 55;
   const t = Math.max(0, Math.min(100, v)) / 100;
   const root = document.documentElement.style;
-  root.setProperty("--np-overlay-a", (0.08 + t * 0.62).toFixed(2));
-  root.setProperty("--np-overlay-mid", (0.20 + t * 0.65).toFixed(2));
-  root.setProperty("--np-overlay-b", (0.35 + t * 0.55).toFixed(2));
-  root.setProperty("--np-text-shadow-blur", (2 + t * 12).toFixed(1) + "px");
-  root.setProperty("--np-text-shadow-a", (0.25 + t * 0.6).toFixed(2));
-  root.setProperty("--np-mini-bg-a", (0.55 + t * 0.4).toFixed(2));
-  if (els.overlayStrengthInput) els.overlayStrengthInput.value = String(v);
+  // Curve was front-loaded — most of the darkening happened in the
+  // slider's first half, so pushing past ~55% barely changed anything
+  // and even 100% never got close to fully opaque. Squaring t skews the
+  // ramp so the back half of the slider keeps adding real darkness
+  // instead of flattening out, and the ceiling now reaches near-opaque
+  // at 100% instead of stalling at 0.70/0.90.
+  const t2 = t * t * (3 - 2 * t); // smoothstep — gentle at both ends, no flat plateau in the middle either
+  root.setProperty("--np-overlay-a", (0.06 + t2 * 0.82).toFixed(2));
+  root.setProperty("--np-overlay-mid", (0.16 + t2 * 0.78).toFixed(2));
+  root.setProperty("--np-overlay-b", (0.30 + t2 * 0.65).toFixed(2));
+  root.setProperty("--np-text-shadow-blur", (2 + t2 * 14).toFixed(1) + "px");
+  root.setProperty("--np-text-shadow-a", (0.25 + t2 * 0.65).toFixed(2));
+  root.setProperty("--np-mini-bg-a", (0.5 + t2 * 0.48).toFixed(2));
   if (els.overlayStrengthValue) els.overlayStrengthValue.textContent = v + "%";
+  // Only touch the slider's own .value when it's out of sync (i.e. when
+  // this call came from loading/restoring settings, not from the user
+  // actively dragging it) — reassigning .value on every "input" tick,
+  // even to the same number, is what was making the thumb feel like it
+  // was fighting the drag gesture instead of following it smoothly.
+  if (els.overlayStrengthInput && Number(els.overlayStrengthInput.value) !== v) {
+    els.overlayStrengthInput.value = String(v);
+  }
+}
+
+/** Maps Settings → "Song List Darkness" (0-100) onto the CSS variable the
+ *  library scroll area reads for its own tint, laid directly behind the
+ *  song rows on the Library/Favorites/Recent/Folder lists — independent
+ *  of the Now Playing overlay above, since a busy animated theme can make
+ *  song titles hard to read even when nothing is playing yet.
+ *  0 = background fully visible behind the list, 100 = list panel near-black. */
+function applySongListOverlay() {
+  const v = state.settings.songListOverlay ?? 40;
+  const t = Math.max(0, Math.min(100, v)) / 100;
+  document.documentElement.style.setProperty("--songlist-overlay-a", (t * 0.92).toFixed(2));
+  if (els.songListOverlayValue) els.songListOverlayValue.textContent = v + "%";
+  if (els.songListOverlayInput && Number(els.songListOverlayInput.value) !== v) {
+    els.songListOverlayInput.value = String(v);
+  }
 }
 function openSettings() { els.settingsModalOverlay.classList.add("open"); renderFontGrid(); renderThemeGrid(); renderArtStyleGrid(); renderRageBgGrid(); renderRageDripGrid(); }
 function closeSettings() { els.settingsModalOverlay.classList.remove("open"); }
@@ -2249,6 +2284,11 @@ els.overlayStrengthInput.addEventListener("input", () => {
   applyOverlayStrength();
 });
 els.overlayStrengthInput.addEventListener("change", saveSettings);
+els.songListOverlayInput.addEventListener("input", () => {
+  state.settings.songListOverlay = Number(els.songListOverlayInput.value);
+  applySongListOverlay();
+});
+els.songListOverlayInput.addEventListener("change", saveSettings);
 document.getElementById("rageBgGrid").addEventListener("click", (e) => {
   const removeBtn = e.target.closest("[data-remove-custom-bg]");
   if (removeBtn) { e.stopPropagation(); removeCustomBgImage(); return; }
