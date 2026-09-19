@@ -45,6 +45,9 @@ const state = {
   repeat: "off",         // off | all | one
   isPlaying: false,
   addToPlaylistTargetId: null,
+  newPlaylistAddTarget: null, // songs to drop into the playlist being created — set ONLY by the picker's "+ New Playlist" path
+  rowActionsTargetId: null,
+  rowActionsPlaylistId: null,
   settings: { light: false, resume: true, fontStyle: 0, themeId: "none", accentColor: "#C9A84C", accent2Color: "#B22222", artStyle: "sigil", rageMode: false, rageBackground: "none", rageDripType: "smoke", overlayStrength: 55, songListOverlay: 40 },
   usingFSApi: false,
   fileRefs: new Map(),   // songId -> File or FileSystemFileHandle
@@ -98,6 +101,8 @@ const els = {
   miniArtist: $("#miniArtist"),
   miniPlayBtn: $("#miniPlayBtn"),
   miniPlayIcon: $("#miniPlayIcon"),
+  miniPlayIconPath: $("#miniPlayIconPath"),
+  miniPlayIconAnimate: $("#miniPlayIconAnimate"),
   miniPrevBtn: $("#miniPrevBtn"),
   miniNextBtn: $("#miniNextBtn"),
   miniProgressFill: $("#miniProgressFill"),
@@ -121,6 +126,8 @@ const els = {
   prevBtn: $("#prevBtn"),
   playBtn: $("#playBtn"),
   playIcon: $("#playIcon"),
+  playIconPath: $("#playIconPath"),
+  playIconAnimate: $("#playIconAnimate"),
   nextBtn: $("#nextBtn"),
   repeatBtn: $("#repeatBtn"),
   favBtn: $("#favBtn"),
@@ -131,6 +138,12 @@ const els = {
   queueSheet: $("#queueSheet"),
   closeQueueBtn: $("#closeQueueBtn"),
   queueList: $("#queueList"),
+  rowActionsSheetOverlay: $("#rowActionsSheetOverlay"),
+  rowActionsSheet: $("#rowActionsSheet"),
+  closeRowActionsBtn: $("#closeRowActionsBtn"),
+  rowActionsSongTitle: $("#rowActionsSongTitle"),
+  rowActionsSongArtist: $("#rowActionsSongArtist"),
+  rowActionsList: $("#rowActionsList"),
 
   playlistModalOverlay: $("#playlistModalOverlay"),
   playlistModalTitle: $("#playlistModalTitle"),
@@ -938,8 +951,16 @@ async function buildLibraryFromEntries(entries, isFsApi) {
   const folderMap = new Map();
   state.fileRefs.clear();
 
+  const usedIds = new Set();
   for (const e of entries) {
-    const id = hashStr(e.path);
+    // hashStr is a 32-bit hash: on big libraries two different paths CAN
+    // collide, and two songs sharing an id means every action on one hits
+    // the other. Keep the plain hash (so saved favourites/playlists keep
+    // working) but disambiguate any repeat deterministically.
+    let id = hashStr(e.path);
+    if (usedIds.has(id)) { let n = 2; while (usedIds.has(id + "_" + n)) n++; id = id + "_" + n; }
+    usedIds.add(id);
+    e.id = id;
     const filename = e.path.split("/").pop();
     const { artist, title } = titleCaseFromFilename(filename);
     const album = e.folder.split("/").pop() || "Unknown Album";
@@ -981,7 +1002,7 @@ async function loadMetadataProgressively(entries, isFsApi) {
     while (idx < entries.length) {
       const myIdx = idx++;
       const e = entries[myIdx];
-      const id = hashStr(e.path);
+      const id = e.id || hashStr(e.path);
       try {
         const file = isFsApi ? await e.handle.getFile() : e.handle;
         const song = state.songs.find(s => s.id === id);
@@ -997,7 +1018,7 @@ async function loadMetadataProgressively(entries, isFsApi) {
         els.storageLabel.textContent = done < entries.length
           ? `Reading ${done}/${entries.length}…`
           : `${state.songs.length} song${state.songs.length === 1 ? "" : "s"} in your library`;
-        render();
+        if (done < entries.length) scheduleRender(); // throttled + never under a press
       }
     }
   }
@@ -1005,6 +1026,8 @@ async function loadMetadataProgressively(entries, isFsApi) {
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   els.storageLabel.textContent = `${state.songs.length} song${state.songs.length === 1 ? "" : "s"} in your library`;
   setStorageBusy(false);
+  clearTimeout(scheduledRenderTimer); scheduledRenderTimer = null;
+  render(); // final pass with every duration/art now known
   updateNavCounts();
 }
 
@@ -1443,6 +1466,99 @@ function filterSongs(list) {
 function visibleSongs(list) { return sortSongs(filterSongs(list)); }
 
 /* ---------------------------------------------------------------------
+   Keyed DOM patching for the list views.
+
+   Every view used to be rebuilt with `el.innerHTML = …`, which destroys
+   and recreates EVERY row on every render — and render() runs a lot
+   (each favourite toggle, each track change, and every 12 files while the
+   library's metadata loads in the background). Rebuilding under the
+   user's finger meant a tap that started on one ⋮ button and ended on its
+   freshly created twin never produced a `click` at all, the row under the
+   pointer lost hover/focus, and big libraries did a full re-layout each
+   time. patchChildren() instead keeps every row whose markup is unchanged
+   (matched by song id), replaces only rows that actually changed, and
+   restores keyboard focus if the focused node had to be replaced.
+   --------------------------------------------------------------------- */
+const _innerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+function rowKey(node) {
+  return node.nodeType === 1 && node.classList.contains("song-row") && node.dataset.id ? "row:" + node.dataset.id : null;
+}
+function describeFocus(parent) {
+  const ae = document.activeElement;
+  if (!ae || ae === document.body || !parent.contains(ae)) return null;
+  const row = ae.closest(".song-row");
+  return {
+    rowId: row ? row.dataset.id : null,
+    isRow: ae === row,
+    cls: ae.classList && ae.classList.contains("row-menu-btn") ? "row-menu-btn" : null,
+    id: ae.id || null,
+    action: ae.dataset ? ae.dataset.action || null : null,
+  };
+}
+function restoreFocus(parent, f) {
+  if (!f) return;
+  const ae = document.activeElement;
+  if (ae && ae !== document.body && parent.contains(ae)) return; // still focused — nothing to do
+  let target = null;
+  if (f.id) target = parent.querySelector("#" + CSS.escape(f.id));
+  else if (f.rowId) {
+    const row = parent.querySelector('.song-row[data-id="' + CSS.escape(f.rowId) + '"]');
+    if (row) target = f.isRow ? row : (f.cls ? row.querySelector("." + f.cls) : null);
+  }
+  if (target) target.focus({ preventScroll: true });
+}
+function patchChildren(parent, html) {
+  const focus = describeFocus(parent);
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const next = Array.from(tpl.content.childNodes);
+  const cur = Array.from(parent.childNodes);
+  const oldByKey = new Map(), oldPlain = [];
+  for (const n of cur) { const k = rowKey(n); if (k) oldByKey.set(k, n); else oldPlain.push(n); }
+  let plainIdx = 0;
+  const finalNodes = next.map((n) => {
+    const k = rowKey(n);
+    let old = null;
+    if (k) { old = oldByKey.get(k) || null; if (old) oldByKey.delete(k); }
+    else old = oldPlain[plainIdx++] || null;
+    return old && old.isEqualNode(n) ? old : n; // unchanged → keep the live node untouched
+  });
+  const keep = new Set(finalNodes);
+  for (const n of cur) if (!keep.has(n)) parent.removeChild(n);
+  let cursor = parent.firstChild;
+  for (const n of finalNodes) {
+    if (n === cursor) cursor = cursor.nextSibling;
+    else parent.insertBefore(n, cursor);
+  }
+  restoreFocus(parent, focus);
+}
+[els.viewSongs, els.viewPlaylists, els.viewPlaylistDetail, els.viewFolders, els.viewFolderDetail, els.viewFavorites, els.viewRecent, els.viewExternal]
+  .forEach((el) => Object.defineProperty(el, "innerHTML", {
+    configurable: true,
+    get() { return _innerHTMLDesc.get.call(this); },
+    set(html) { patchChildren(this, String(html)); },
+  }));
+
+/* Tracks a press in progress so background re-renders can wait it out. */
+let pointerIsDownAt = 0;
+document.addEventListener("pointerdown", () => { pointerIsDownAt = Date.now(); }, true);
+["pointerup", "pointercancel", "dragend"].forEach((t) => document.addEventListener(t, () => { pointerIsDownAt = 0; }, true));
+window.addEventListener("blur", () => { pointerIsDownAt = 0; });
+/** Coalesced render for background/progress updates (metadata loading):
+ *  at most one rebuild per `minGap` ms, and never while a finger/mouse is
+ *  mid-press (capped at 1.5s so a lost pointerup can't stall it). */
+let scheduledRenderTimer = null, lastRenderAt = 0;
+function scheduleRender(minGap = 450) {
+  if (scheduledRenderTimer) return;
+  const run = () => {
+    if (pointerIsDownAt && Date.now() - pointerIsDownAt < 1500) { scheduledRenderTimer = setTimeout(run, 120); return; }
+    scheduledRenderTimer = null;
+    render();
+  };
+  scheduledRenderTimer = setTimeout(run, Math.max(0, minGap - (performance.now() - lastRenderAt)));
+}
+
+/* ---------------------------------------------------------------------
    Rendering
    --------------------------------------------------------------------- */
 function songRowHtml(song, index, opts = {}) {
@@ -1461,13 +1577,8 @@ function songRowHtml(song, index, opts = {}) {
     </div>
     <span class="dur">${song.duration ? fmtTime(song.duration) : ""}</span>
     ${selecting ? "" : `<div class="row-actions">
-      <button class="fav-btn ${fav ? "active" : ""}" data-action="fav" data-id="${song.id}" title="Favorite">
-        <svg viewBox="0 0 24 24" fill="${fav ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2"><path d="M20.8 4.6a5.5 5.5 0 00-7.8 0L12 5.6l-1-1a5.5 5.5 0 00-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 000-7.8z"/></svg>
-      </button>
-      <button class="queue-btn" data-action="queue" data-id="${song.id}" title="Play next">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h9M4 12h9M4 18h9M17 6v12m0 0l-3-3m3 3l3-3"/></svg>
-      </button>
-      <button class="more-btn" data-action="more" data-id="${song.id}" title="Add to playlist">
+      <button class="row-menu-btn" data-action="row-menu" data-id="${song.id}" title="Song actions">
+        ${fav ? `<span class="fav-dot" title="Favorited"></span>` : ""}
         <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
       </button>
     </div>`}
@@ -1620,6 +1731,7 @@ function playlistRowHtml(song, index, playlistId) {
   const isPlaying = state.queue[state.queueIndex] === song.id;
   const selecting = state.selectMode;
   const selected = selecting && state.selectedIds.has(song.id);
+  const fav = state.favorites.has(song.id);
   return `
   <div class="song-row ${isPlaying ? "playing" : ""} ${selected ? "selected" : ""}" data-id="${song.id}" data-playlist-ctx="${playlistId}" tabindex="0" role="button">
     ${selecting ? `<span class="row-check" data-action="toggle-select" data-id="${song.id}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M4 12l5 5L20 6"/></svg></span>` : ""}
@@ -1630,11 +1742,9 @@ function playlistRowHtml(song, index, playlistId) {
     </div>
     <span class="dur">${song.duration ? fmtTime(song.duration) : ""}</span>
     ${selecting ? "" : `<div class="row-actions">
-      <button class="queue-btn" data-action="queue" data-id="${song.id}" title="Play next">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h9M4 12h9M4 18h9M17 6v12m0 0l-3-3m3 3l3-3"/></svg>
-      </button>
-      <button class="more-btn" data-action="remove-from-playlist" data-id="${song.id}" data-playlist="${playlistId}" title="Remove">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      <button class="row-menu-btn" data-action="row-menu" data-id="${song.id}" title="Song actions">
+        ${fav ? `<span class="fav-dot" title="Favorited"></span>` : ""}
+        <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
       </button>
     </div>`}
   </div>`;
@@ -1713,10 +1823,17 @@ function updateNavCounts() {
 }
 
 function render() {
+  lastRenderAt = performance.now();
   updateNavCounts();
   const v = state.currentView;
-  [els.viewSongs, els.viewPlaylists, els.viewPlaylistDetail, els.viewFolders, els.viewFolderDetail, els.viewFavorites, els.viewRecent, els.viewExternal]
-    .forEach(el => el.classList.add("hidden"));
+  // Hide only the views that AREN'T current. Hiding all eight and then
+  // un-hiding one collapses the scroller's height for a moment, and any
+  // layout that lands in between clamps scrollTop to 0 — the list would
+  // jump to the top after an action on a song lower down.
+  const viewByName = { songs: els.viewSongs, playlists: els.viewPlaylists, "playlist-detail": els.viewPlaylistDetail, folders: els.viewFolders,
+    "folder-detail": els.viewFolderDetail, favorites: els.viewFavorites, recent: els.viewRecent, external: els.viewExternal };
+  Object.entries(viewByName).forEach(([name, el]) => { if (name !== v) el.classList.add("hidden"); });
+  const keepScroll = els.contentScroll.scrollTop;
 
   if (v === "songs") { els.viewSongs.classList.remove("hidden"); renderSongsView(); els.viewTitle.textContent = "Library"; }
   else if (v === "playlists") { els.viewPlaylists.classList.remove("hidden"); renderPlaylistsView(); els.viewTitle.textContent = "Playlists"; }
@@ -1727,17 +1844,37 @@ function render() {
   else if (v === "recent") { els.viewRecent.classList.remove("hidden"); renderRecentView(); els.viewTitle.textContent = "Recently Played"; }
   else if (v === "external") { els.viewExternal.classList.remove("hidden"); renderExternalView(); els.viewTitle.textContent = "External Playlists"; }
 
-  els.contentScroll.scrollTop = render._lastView === v ? els.contentScroll.scrollTop : 0;
+  els.contentScroll.scrollTop = render._lastView === v ? keepScroll : 0;
   render._lastView = v;
 }
 
+/* ---------------------------------------------------------------------
+   DJ-set view transitions — see the matching CSS block above
+   .content-scroll for what each move looks like.
+   --------------------------------------------------------------------- */
+const DJ_DETAIL_VIEWS = new Set(["folder-detail", "playlist-detail"]);
+function pickViewTransition(fromView, toView) {
+  if (DJ_DETAIL_VIEWS.has(toView) && !DJ_DETAIL_VIEWS.has(fromView)) return "drop";
+  if (!DJ_DETAIL_VIEWS.has(toView) && DJ_DETAIL_VIEWS.has(fromView)) return "spinback";
+  return "swap";
+}
+function playViewTransition(kind) {
+  const el = els.contentScroll;
+  if (!el) return;
+  el.classList.remove("dj-swap", "dj-drop", "dj-spinback");
+  void el.offsetWidth; // reflow so the animation restarts even on back-to-back navigations
+  el.classList.add(`dj-${kind}`);
+}
 function navigateTo(view) {
+  const fromView = state.currentView;
+  const transitionKind = pickViewTransition(fromView, view);
   state.currentView = view;
   state.selectMode = false;
   state.selectedIds.clear();
   els.navItems.forEach(b => b.classList.toggle("active", b.dataset.view === view));
   els.tabbarBtns.forEach(b => b.classList.toggle("active", b.dataset.view === view));
   render();
+  playViewTransition(transitionKind);
 }
 
 /* ---------------------------------------------------------------------
@@ -1764,13 +1901,34 @@ async function playSongId(songId, queueList) {
 }
 
 /** "Add up next" — inserts right after the currently playing track, or
- *  starts a fresh queue with it if nothing is playing yet. */
+ *  stages a fresh queue with it if nothing is queued yet. Either way this
+ *  only queues the song — it never starts playback on its own, matching
+ *  what the "Play next" button actually promises. */
 function addToQueueNext(songId) {
   const song = state.songs.find(s => s.id === songId);
   if (!song) return;
-  if (!state.queue.length) { playSongId(songId); return; }
+  if (!state.queue.length) {
+    // Nothing queued yet: make this the queue's first song so a later
+    // tap on Play has something to play, but don't start it ourselves —
+    // clicking "Play next" should queue, not play.
+    state.queue = [songId];
+    state.queueIndex = 0;
+    syncNowPlayingUI(song);
+    updateMediaSession(song);
+    toast(`Up next: ${song.title}`);
+    if (els.queueSheet.classList.contains("open")) renderQueueSheet();
+    render();
+    return;
+  }
   // If it's already queued somewhere, relocate it rather than duplicate it.
   const existingIndex = state.queue.indexOf(songId);
+  // …but if it IS the current song, there's nothing to move. Relocating it
+  // used to splice the playing track out from under the audio: queueIndex
+  // then pointed at a different song than the one audible.
+  if (existingIndex !== -1 && existingIndex === state.queueIndex) {
+    toast(`"${song.title}" is already playing`);
+    return;
+  }
   if (existingIndex !== -1) {
     state.queue.splice(existingIndex, 1);
     if (existingIndex < state.queueIndex) state.queueIndex--; // removing an earlier item shifts the current index down
@@ -1873,18 +2031,80 @@ function syncPlayerFavIcon() {
   els.favBtn.querySelector("svg").setAttribute("fill", fav ? "currentColor" : "none");
   els.favBtn.style.color = fav ? "var(--accent2)" : "";
 }
+/* ---------------------------------------------------------------------
+   Play/Pause icon — a genuine shape-shift, not a hard swap. Both the
+   triangle and the twin bars are expressed as the same 12-point closed
+   polygon (the triangle is just the twin-bars' 12 corners resampled
+   evenly around its own perimeter, and the bars are drawn as one path
+   with a hairline "slit" between them so they still read as two
+   separate rectangles at rest). Same point count + same command order
+   on both ends means the browser can tween every point in a straight
+   line from one shape to the other — the SMIL <animate> on each <path>
+   (see index.html) plays that tween; setAttribute below guarantees the
+   resting shape is still correct even if SMIL somehow isn't available.
+   --------------------------------------------------------------------- */
+const PLAY_ICON_D = "M8,5 L10.82,6.79 L13.63,8.58 L16.45,10.37 L18.73,12.17 L15.91,13.97 L13.09,15.76 L10.28,17.55 L8,18.36 L8,15.02 L8,11.68 L8,8.34 Z";
+const PAUSE_ICON_D = "M7,5 L11,5 L11,12 L13,12 L13,5 L17,5 L17,19 L13,19 L13,12 L11,12 L11,19 L7,19 Z";
+function morphPlayIcon(pathEl, animateEl, playing) {
+  if (!pathEl) return;
+  const from = pathEl.getAttribute("d");
+  const to = playing ? PAUSE_ICON_D : PLAY_ICON_D;
+  if (from === to) return;
+  pathEl.setAttribute("d", to);
+  if (animateEl) {
+    animateEl.setAttribute("from", from);
+    animateEl.setAttribute("to", to);
+    try { animateEl.beginElement(); } catch (e) { /* SMIL restart unsupported in a handful of older embedded webviews — the setAttribute above already leaves the correct final shape */ }
+  }
+  const svg = pathEl.closest("svg");
+  if (svg) { svg.classList.remove("dj-icon-morph"); void svg.offsetWidth; svg.classList.add("dj-icon-morph"); }
+}
 function setPlayIcon(playing) {
-  const pathPlay = '<path d="M8 5v14l11-7z"/>';
-  const pathPause = '<path d="M7 5h4v14H7zM13 5h4v14h-4z"/>';
-  els.playIcon.innerHTML = playing ? pathPause : pathPlay;
-  els.miniPlayIcon.innerHTML = playing ? pathPause : pathPlay;
+  morphPlayIcon(els.playIconPath, els.playIconAnimate, playing);
+  morphPlayIcon(els.miniPlayIconPath, els.miniPlayIconAnimate, playing);
+}
+
+/* ---------------------------------------------------------------------
+   Play / Pause transitions — see the matching CSS block above
+   .player-art-wrap for what each move looks like.
+   --------------------------------------------------------------------- */
+function triggerLoopTighten() {
+  [els.playerArt, els.miniArt].forEach(el => {
+    if (!el) return;
+    el.classList.remove("dj-loop-tighten"); void el.offsetWidth;
+    el.classList.add("dj-loop-tighten");
+  });
+}
+function triggerEchoOut(artEl) {
+  if (!artEl) return;
+  if (getComputedStyle(artEl).position === "static") artEl.style.position = "relative";
+  for (let i = 0; i < 3; i++) {
+    const ghost = artEl.cloneNode(true);
+    ghost.removeAttribute("id");
+    ghost.classList.add("dj-echo-ghost");
+    ghost.style.position = "absolute";
+    ghost.style.inset = "0";
+    ghost.style.margin = "0";
+    ghost.style.pointerEvents = "none";
+    ghost.style.animationDelay = `${i * 90}ms`;
+    artEl.appendChild(ghost);
+    setTimeout(() => ghost.remove(), 650 + i * 90);
+  }
 }
 
 function togglePlay() {
   if (!audio.src) return;
   RageMode.ensureAudioGraph();
-  if (audio.paused) { audio.play().catch(()=>{}); state.isPlaying = true; }
-  else { audio.pause(); state.isPlaying = false; }
+  if (audio.paused) {
+    audio.play().catch(()=>{});
+    state.isPlaying = true;
+    triggerLoopTighten();
+  } else {
+    audio.pause();
+    state.isPlaying = false;
+    triggerEchoOut(els.playerArt);
+    triggerEchoOut(els.miniArt);
+  }
   setPlayIcon(state.isPlaying);
   if ("mediaSession" in navigator) navigator.mediaSession.playbackState = state.isPlaying ? "playing" : "paused";
 }
@@ -2017,10 +2237,78 @@ function renderQueueSheet() {
     const song = state.songs.find(s => s.id === id);
     return song ? queueRowHtml(song, i) : "";
   }).join("");
-  els.queueList.innerHTML = items || emptyStateHtml("Queue is empty", "Play a song to build your queue.", '<path d="M4 6h16M4 12h10M4 18h16"/>');
+  els.queueList.innerHTML = items || emptyStateHtml("Queue is empty", "Play a song, or tap \"Play next\" on one, to build your queue.", '<path d="M4 6h16M4 12h10M4 18h16"/>');
 }
 function openQueue() { renderQueueSheet(); els.sheetOverlay.classList.add("open"); els.queueSheet.classList.add("open"); }
 function closeQueue() { els.sheetOverlay.classList.remove("open"); els.queueSheet.classList.remove("open"); }
+
+/* ---------------------------------------------------------------------
+   Song actions sheet — opened from the single ⋮ per row. See the HTML
+   comment on #rowActionsSheet for why this replaced the old three-icon
+   row-actions cluster.
+   --------------------------------------------------------------------- */
+function rowActionItemHtml({ action, icon, label, active, danger }) {
+  return `<button type="button" class="row-action-item ${active ? "active" : ""} ${danger ? "danger" : ""}" data-action="${action}">
+    <svg viewBox="0 0 24 24" fill="${active && action === "sheet-fav" ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2">${icon}</svg>
+    <span>${label}</span>
+  </button>`;
+}
+function renderRowActionsList() {
+  const song = state.songs.find(s => s.id === state.rowActionsTargetId);
+  if (!song) return;
+  const fav = state.favorites.has(song.id);
+  const items = [
+    rowActionItemHtml({
+      action: "sheet-fav", active: fav,
+      label: fav ? "Remove from Favorites" : "Add to Favorites",
+      icon: `<path d="M20.8 4.6a5.5 5.5 0 00-7.8 0L12 5.6l-1-1a5.5 5.5 0 00-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 000-7.8z"/>`,
+    }),
+    rowActionItemHtml({
+      action: "sheet-queue", label: "Play Next",
+      icon: `<path d="M4 6h9M4 12h9M4 18h9M17 6v12m0 0l-3-3m3 3l3-3"/>`,
+    }),
+    rowActionItemHtml({
+      action: "sheet-playlist", label: "Add to Playlist",
+      icon: `<path d="M12 5v14M5 12h14"/>`,
+    }),
+  ];
+  if (state.rowActionsPlaylistId) {
+    items.push(rowActionItemHtml({
+      action: "sheet-remove-from-playlist", danger: true, label: "Remove from This Playlist",
+      icon: `<path d="M6 6l12 12M18 6L6 18"/>`,
+    }));
+  }
+  els.rowActionsSongTitle.textContent = song.title;
+  els.rowActionsSongArtist.textContent = song.artist;
+  els.rowActionsList.innerHTML = items.join("");
+}
+function openRowActionSheet(songId, playlistId = null) {
+  state.rowActionsTargetId = songId;
+  state.rowActionsPlaylistId = playlistId;
+  renderRowActionsList();
+  els.rowActionsSheetOverlay.classList.add("open");
+  els.rowActionsSheet.classList.add("open");
+  // Keyboard users: move focus into the menu (a closed sheet is now
+  // visibility:hidden, so this only works once .open is set, as above).
+  const first = els.rowActionsList.querySelector("button");
+  if (first) first.focus({ preventScroll: true });
+}
+function closeRowActionSheet() {
+  const openerId = state.rowActionsTargetId;
+  els.rowActionsSheetOverlay.classList.remove("open");
+  els.rowActionsSheet.classList.remove("open");
+  state.rowActionsTargetId = null;
+  state.rowActionsPlaylistId = null;
+  // Hand focus back to the ⋮ that opened the menu (unless another dialog
+  // took over, e.g. the playlist picker), so keyboard users keep their place.
+  if (openerId) requestAnimationFrame(() => {
+    if (document.querySelector(".modal-overlay.open")) return;
+    const ae = document.activeElement;
+    if (ae && ae !== document.body && !els.rowActionsSheet.contains(ae)) return;
+    const btn = els.contentScroll.querySelector('.row-menu-btn[data-id="' + CSS.escape(openerId) + '"]');
+    if (btn) btn.focus({ preventScroll: true });
+  });
+}
 
 /* ---------------------------------------------------------------------
    Add-to-playlist / new-playlist modals
@@ -2041,9 +2329,15 @@ function openPlaylistModal(songIdOrIds) {
     : `<p style="color:var(--text-muted);font-size:13px;">No playlists yet — create one below.</p>`;
   els.playlistModalOverlay.classList.add("open");
 }
-function closePlaylistModal() { els.playlistModalOverlay.classList.remove("open"); }
+function closePlaylistModal() {
+  els.playlistModalOverlay.classList.remove("open");
+  // The target belongs to THIS picker. It used to survive Close / a finished
+  // add, so the next playlist created from the Playlists tab silently
+  // received the songs from an unrelated earlier "Add to Playlist".
+  state.addToPlaylistTargetId = null;
+}
 function openNewPlaylistModal() {
-  state.playlistModalMode = "create"; state.renameTargetId = null;
+  state.playlistModalMode = "create"; state.renameTargetId = null; state.newPlaylistAddTarget = null;
   els.newPlaylistModalTitle.textContent = "New Playlist";
   els.confirmNewPlaylistBtn.textContent = "Create";
   els.newPlaylistModalOverlay.classList.add("open"); els.newPlaylistInput.value = ""; els.newPlaylistInput.focus();
@@ -2051,12 +2345,22 @@ function openNewPlaylistModal() {
 function openRenamePlaylistModal(playlistId) {
   const pl = state.playlists.find(p => p.id === playlistId);
   if (!pl) return;
-  state.playlistModalMode = "rename"; state.renameTargetId = playlistId;
+  state.playlistModalMode = "rename"; state.renameTargetId = playlistId; state.newPlaylistAddTarget = null;
   els.newPlaylistModalTitle.textContent = "Rename Playlist";
   els.confirmNewPlaylistBtn.textContent = "Save";
   els.newPlaylistModalOverlay.classList.add("open"); els.newPlaylistInput.value = pl.name; els.newPlaylistInput.focus(); els.newPlaylistInput.select();
 }
 function closeNewPlaylistModal() { els.newPlaylistModalOverlay.classList.remove("open"); }
+/** Backing out of "New Playlist": if it was opened from the Add-to-Playlist
+ *  picker, go back to that picker with the same song(s) still targeted;
+ *  either way nothing stays pending. */
+function cancelNewPlaylistModal() {
+  const back = state.newPlaylistAddTarget;
+  const wasRename = state.playlistModalMode === "rename";
+  closeNewPlaylistModal();
+  state.newPlaylistAddTarget = null;
+  if (back && !wasRename) openPlaylistModal(back);
+}
 
 /* ---------------------------------------------------------------------
    Settings modal + theme
@@ -2500,7 +2804,25 @@ async function triggerInstall() {
 }
 
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
-  window.addEventListener("load", () => {
+  window.addEventListener("load", async () => {
+    // Self-healing: a service worker from an older deploy can keep serving
+    // its cached (stale) app.js/index.html forever, since it outlives a
+    // normal deploy until something explicitly replaces it — which is
+    // exactly how a bug that's already fixed in the source can still show
+    // up for someone testing in a browser that visited an earlier build.
+    // Rather than requiring a manual DevTools → Unregister every time,
+    // clear out anything left over from a previous version on every load,
+    // then register fresh. (If a real offline-caching sw.js is added later,
+    // this eager wipe should be scoped to a one-time version check instead
+    // of running unconditionally, so it doesn't fight the new cache.)
+    try {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+    } catch (e) { /* best-effort cleanup only — never block the app on this */ }
     navigator.serviceWorker.register("sw.js").catch(() => {});
   });
 }
@@ -2650,14 +2972,14 @@ els.iosModalOverlay.addEventListener("click", (e) => { if (e.target === els.iosM
 
 // Content clicks (delegated) — song rows, folder/playlist cards, action buttons
 els.contentScroll.addEventListener("click", (e) => {
-  const favBtn = e.target.closest('[data-action="fav"]');
-  if (favBtn) { window.VV.PixieDust.burstFromEl(favBtn); toggleFavorite(favBtn.dataset.id); return; }
-  const queueBtn = e.target.closest('[data-action="queue"]');
-  if (queueBtn) { window.VV.PixieDust.burstFromEl(queueBtn); addToQueueNext(queueBtn.dataset.id); return; }
-  const moreBtn = e.target.closest('[data-action="more"]');
-  if (moreBtn) { openPlaylistModal(moreBtn.dataset.id); return; }
-  const rmBtn = e.target.closest('[data-action="remove-from-playlist"]');
-  if (rmBtn) { removeSongFromPlaylist(rmBtn.dataset.playlist, rmBtn.dataset.id); return; }
+  const menuBtn = e.target.closest('[data-action="row-menu"]');
+  if (menuBtn) {
+    e.stopPropagation();
+    window.VV.PixieDust.burstFromEl(menuBtn);
+    const row = menuBtn.closest(".song-row");
+    openRowActionSheet(menuBtn.dataset.id, row ? row.dataset.playlistCtx || null : null);
+    return;
+  }
   const delPl = e.target.closest('[data-action="delete-playlist"]');
   if (delPl) { if (confirm("Delete this playlist?")) deletePlaylist(delPl.dataset.id); return; }
   const renamePl = e.target.closest('[data-action="rename-playlist"]');
@@ -2713,22 +3035,44 @@ els.contentScroll.addEventListener("click", (e) => {
 
   const row = e.target.closest(".song-row");
   if (row) {
-    const id = row.dataset.id;
-    if (state.selectMode) { toggleRowSelected(id); return; }
-    window.VV.PixieDust.burstFromEl(row);
-    let queueList;
-    if (state.currentView === "folder-detail") queueList = visibleSongs(state.songs.filter(s => (state.foldersMap.get(state.currentFolder) || []).includes(s.id))).map(s => s.id);
-    else if (state.currentView === "playlist-detail") { const pl = state.playlists.find(p => p.id === state.currentPlaylist); queueList = visibleSongs(pl.songIds.map(sid => state.songs.find(s => s.id === sid)).filter(Boolean)).map(s => s.id); }
-    else if (state.currentView === "favorites") queueList = visibleSongs(state.songs.filter(s => state.favorites.has(s.id))).map(s => s.id);
-    else if (state.currentView === "recent") queueList = visibleSongs(recentlyPlayedSongs()).map(s => s.id);
-    else queueList = visibleSongs(state.songs).map(s => s.id);
-    playSongId(id, queueList);
-    openPlayer();
+    // Defensive guard: if the click landed on ANY button inside the row,
+    // never fall through to "play this row" — a button click should only
+    // ever do what that button says.
+    if (e.target.closest("button")) return;
+    if (state.selectMode) { toggleRowSelected(row.dataset.id); return; }
+    activateSongRow(row);
   }
 });
 
+// Shared by the click handler above and the keydown handler below, so a
+// song row (role="button") behaves the same whether it's clicked or
+// activated from the keyboard.
+function activateSongRow(row) {
+  const id = row.dataset.id;
+  window.VV.PixieDust.burstFromEl(row);
+  let queueList;
+  if (state.currentView === "folder-detail") queueList = visibleSongs(state.songs.filter(s => (state.foldersMap.get(state.currentFolder) || []).includes(s.id))).map(s => s.id);
+  else if (state.currentView === "playlist-detail") { const pl = state.playlists.find(p => p.id === state.currentPlaylist); queueList = visibleSongs(pl.songIds.map(sid => state.songs.find(s => s.id === sid)).filter(Boolean)).map(s => s.id); }
+  else if (state.currentView === "favorites") queueList = visibleSongs(state.songs.filter(s => state.favorites.has(s.id))).map(s => s.id);
+  else if (state.currentView === "recent") queueList = visibleSongs(recentlyPlayedSongs()).map(s => s.id);
+  else queueList = visibleSongs(state.songs).map(s => s.id);
+  playSongId(id, queueList);
+  openPlayer();
+}
+
 // External playlist inputs (re-rendered each time, so listen via delegation)
 els.contentScroll.addEventListener("keydown", (e) => {
+  // .song-row carries role="button" tabindex="0", which only promises
+  // keyboard operability if we actually wire up Enter/Space ourselves —
+  // browsers don't do it for free on non-native buttons. Only fires when
+  // the row itself is focused, not when focus is on one of its nested
+  // action buttons (those already handle their own Enter/Space natively).
+  if ((e.key === "Enter" || e.code === "Space") && e.target.classList.contains("song-row")) {
+    e.preventDefault();
+    if (state.selectMode) { toggleRowSelected(e.target.dataset.id); return; }
+    activateSongRow(e.target);
+    return;
+  }
   if (e.key === "Enter" && (e.target.id === "externalPlaylistInput" || e.target.id === "externalPlaylistNameInput")) {
     e.preventDefault();
     addExternalPlaylist();
@@ -2788,12 +3132,17 @@ els.playlistPickList.addEventListener("click", (e) => {
     closePlaylistModal();
   }
 });
-els.newPlaylistFromModalBtn.addEventListener("click", () => { closePlaylistModal(); openNewPlaylistModal(); });
+els.newPlaylistFromModalBtn.addEventListener("click", () => {
+  const target = state.addToPlaylistTargetId;
+  closePlaylistModal();
+  openNewPlaylistModal();
+  state.newPlaylistAddTarget = target; // only THIS path carries songs into the new playlist
+});
 els.closePlaylistModalBtn.addEventListener("click", closePlaylistModal);
 els.playlistModalOverlay.addEventListener("click", (e) => { if (e.target === els.playlistModalOverlay) closePlaylistModal(); });
 
-els.cancelNewPlaylistBtn.addEventListener("click", closeNewPlaylistModal);
-els.newPlaylistModalOverlay.addEventListener("click", (e) => { if (e.target === els.newPlaylistModalOverlay) closeNewPlaylistModal(); });
+els.cancelNewPlaylistBtn.addEventListener("click", cancelNewPlaylistModal);
+els.newPlaylistModalOverlay.addEventListener("click", (e) => { if (e.target === els.newPlaylistModalOverlay) cancelNewPlaylistModal(); });
 els.confirmNewPlaylistBtn.addEventListener("click", async () => {
   const name = els.newPlaylistInput.value.trim();
   if (!name) { toast("Give it a name first."); return; }
@@ -2802,9 +3151,10 @@ els.confirmNewPlaylistBtn.addEventListener("click", async () => {
     closeNewPlaylistModal();
     return;
   }
+  const target = state.newPlaylistAddTarget; // read BEFORE anything awaits or closes
+  state.newPlaylistAddTarget = null;
   const pl = await createPlaylist(name);
   closeNewPlaylistModal();
-  const target = state.addToPlaylistTargetId;
   if (target) {
     if (Array.isArray(target)) {
       await addSongsToPlaylist(pl.id, target);
@@ -2813,7 +3163,6 @@ els.confirmNewPlaylistBtn.addEventListener("click", async () => {
     } else {
       await addSongToPlaylist(pl.id, target);
     }
-    state.addToPlaylistTargetId = null;
     render();
   }
 });
@@ -2883,22 +3232,95 @@ els.queueList.addEventListener("click", (e) => {
   const rmBtn = e.target.closest('[data-action="remove-from-queue"]');
   if (rmBtn) {
     const idx = Number(rmBtn.dataset.queueIndex);
+    const removingCurrent = idx === state.queueIndex;
     state.queue.splice(idx, 1);
     if (idx < state.queueIndex) state.queueIndex--;
-    else if (idx === state.queueIndex) state.queueIndex = Math.min(state.queueIndex, state.queue.length - 1);
+    else if (removingCurrent) state.queueIndex = Math.min(state.queueIndex, state.queue.length - 1);
+    if (removingCurrent) {
+      // The song that was actually loaded/playing just got deleted out from
+      // under it — without this, audio keeps playing the removed track
+      // while queueIndex silently points somewhere else, so Next/Prev and
+      // the on-screen title immediately go out of sync with what's audible.
+      if (state.queue.length) {
+        loadAndPlayCurrent();
+      } else {
+        audio.pause();
+        audio.removeAttribute("src");
+        state.isPlaying = false;
+        setPlayIcon(false);
+        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "none";
+      }
+    }
     renderQueueSheet();
     render();
     return;
   }
   const row = e.target.closest(".song-row");
-  if (row) { state.queueIndex = Number(row.dataset.queueIndex); loadAndPlayCurrent(); closeQueue(); }
+  if (row) {
+    if (e.target.closest("button")) return; // don't jump-and-play when the remove button was tapped
+    state.queueIndex = Number(row.dataset.queueIndex); loadAndPlayCurrent(); closeQueue();
+  }
+});
+
+els.closeRowActionsBtn.addEventListener("click", closeRowActionSheet);
+els.rowActionsSheetOverlay.addEventListener("click", closeRowActionSheet);
+els.rowActionsList.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-action]");
+  if (!btn) return;
+  const songId = state.rowActionsTargetId;
+  if (!songId) return;
+  if (btn.dataset.action === "sheet-fav") {
+    toggleFavorite(songId);
+    renderRowActionsList(); // reflect the new state immediately without closing the sheet
+    const again = els.rowActionsList.querySelector('[data-action="sheet-fav"]');
+    if (again) again.focus({ preventScroll: true }); // the list was rebuilt — keep keyboard focus on the same item
+  } else if (btn.dataset.action === "sheet-queue") {
+    addToQueueNext(songId);
+    closeRowActionSheet();
+  } else if (btn.dataset.action === "sheet-playlist") {
+    closeRowActionSheet();
+    openPlaylistModal(songId);
+  } else if (btn.dataset.action === "sheet-remove-from-playlist") {
+    removeSongFromPlaylist(state.rowActionsPlaylistId, songId);
+    closeRowActionSheet();
+  }
 });
 
 window.addEventListener("keydown", (e) => {
-  if (e.target.tagName === "INPUT") return;
+  // Only bother checking what's focused for the keys we actually care
+  // about — cheaper, and avoids ever touching e.target for keys (or
+  // synthetic/edge-case targets) this shortcut has no business near.
+  if (e.code !== "Space" && !((e.code === "ArrowRight" || e.code === "ArrowLeft") && e.shiftKey)) return;
+  // Don't hijack Space/Shift+Arrow when focus is on any control that has
+  // its own native meaning for those keys — text inputs, selects, and
+  // (crucially) buttons/links/anything focusable. A focused <button>
+  // activates on Space; without this check that Space also fired the
+  // global "toggle playback" shortcut and preventDefault() suppressed
+  // the button's own click — so keyboard-focusing the song-options (⋮)
+  // button and pressing Space silently toggled playback instead of
+  // opening the menu.
+  const t = e.target;
+  const interactive = t instanceof window.Element && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+    t.tagName === "SELECT" || t.tagName === "BUTTON" || t.isContentEditable || t.closest('[role="button"], [tabindex]'));
+  if (interactive) return;
   if (e.code === "Space") { e.preventDefault(); togglePlay(); }
-  else if (e.code === "ArrowRight" && e.shiftKey) nextSong(false);
-  else if (e.code === "ArrowLeft" && e.shiftKey) prevSong();
+  else if (e.code === "ArrowRight") nextSong(false);
+  else if (e.code === "ArrowLeft") prevSong();
+});
+
+// Escape closes whichever sheet/modal is currently open, innermost first —
+// the theme carousel has its own Escape handling above (it also needs
+// ArrowLeft/Right while open), everything else funnels through here so
+// every overlay in the app is dismissable from the keyboard, not just
+// by clicking its backdrop.
+window.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (els.newPlaylistModalOverlay.classList.contains("open")) cancelNewPlaylistModal();
+  else if (els.playlistModalOverlay.classList.contains("open")) closePlaylistModal();
+  else if (els.rowActionsSheet.classList.contains("open")) closeRowActionSheet();
+  else if (els.queueSheet.classList.contains("open")) closeQueue();
+  else if (els.settingsModalOverlay.classList.contains("open")) closeSettings();
+  else if (els.playerOverlay.classList.contains("open")) closePlayer();
 });
 
 window.addEventListener("resize", () => {
