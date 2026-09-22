@@ -11,7 +11,8 @@
    IndexedDB — delegated to shared.js (VV) so index/video/recap pages
    never open the database at different versions and block each other.
    --------------------------------------------------------------------- */
-const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut, openDB } = window.VV;
+const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut, openDB,
+        createVolumeController, volumeIconMarkup, renderShortcutList } = window.VV;
 
 /* ---------------------------------------------------------------------
    State
@@ -22,6 +23,10 @@ const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, i
 // full list and rationale.
 const AUDIO_EXT = window.VV.AUDIO_EXT;
 const RECENT_CAP = 100;
+// Sidecar lyric files ("Song.lrc" / "Song.txt" next to "Song.mp3") are indexed during the folder
+// scan by their path minus extension, and only ever *read* when that song's lyrics are opened.
+const LYRIC_EXT = /\.(lrc|txt)$/i;
+const lyricKey = (path) => path.replace(/\.[^./]+$/, "").toLowerCase();
 
 const state = {
   songs: [],            // {id, title, artist, album, folder, ext, duration, size, dateAdded, year, handleRef}
@@ -55,6 +60,7 @@ const state = {
   artCache: new Map(),   // unused (kept for backward compat with any external references)
   customArt: new Map(),  // songId -> custom album art data URL (uploaded from device), see loadUserData
   embeddedArt: new Map(), // songId -> the song file's own cover art, extracted from its tag (see loadUserData / loadMetadataProgressively)
+  lyricRefs: new Map(),  // "folder/song" (lower-case, no extension) -> File / FileSystemFileHandle of a sidecar .lrc/.txt
   externalPlaylists: [], // {id, name, type: "playlist"|"channel"|"search", embedId?, query?} — see parseYouTubeInput
 };
 
@@ -106,6 +112,7 @@ const els = {
   miniPrevBtn: $("#miniPrevBtn"),
   miniNextBtn: $("#miniNextBtn"),
   miniProgressFill: $("#miniProgressFill"),
+  miniProgressBuffered: $("#miniProgressBuffered"),
 
   playerOverlay: $("#playerOverlay"),
   playerCollapseBtn: $("#playerCollapseBtn"),
@@ -118,6 +125,7 @@ const els = {
   playerArtist: $("#playerArtist"),
   playerSourceLabel: $("#playerSourceLabel"),
   seekTrack: $("#seekTrack"),
+  seekBuffered: $("#seekBuffered"),
   seekFill: $("#seekFill"),
   seekHandle: $("#seekHandle"),
   curTime: $("#curTime"),
@@ -133,6 +141,12 @@ const els = {
   favBtn: $("#favBtn"),
   addToPlaylistBtn: $("#addToPlaylistBtn"),
   queueBtn: $("#queueBtn"),
+  lyricsBtn: $("#lyricsBtn"),
+  eqBtn: $("#eqBtn"),
+  eqSidebarBtn: $("#eqSidebarBtn"),
+  lyricsSidebarBtn: $("#lyricsSidebarBtn"),
+  settingsEqBtn: $("#settingsEqBtn"),
+  settingsLyricsBtn: $("#settingsLyricsBtn"),
 
   sheetOverlay: $("#sheetOverlay"),
   queueSheet: $("#queueSheet"),
@@ -653,14 +667,15 @@ const RageMode = (() => {
     // reliably instead of silently going flat after a mode switch.
     if (sourceConnected) { if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(() => {}); return true; }
     try {
-      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      const source = audioCtx.createMediaElementSource(audio);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.75;
+      // The single shared Web Audio graph lives in eq.js (a media element can only
+      // be routed through Web Audio once, and the equalizer needs the same path).
+      // The beat analyser it hands back keeps Rage Mode's original 256-bin / 0.75
+      // settings, so the reactivity is unchanged.
+      const graph = window.VaneEQ && window.VaneEQ.ensureGraph(audio);
+      if (!graph) throw new Error("shared audio graph unavailable");
+      audioCtx = graph.ctx;
+      analyser = graph.beat;
       dataArray = new Uint8Array(analyser.frequencyBinCount);
-      source.connect(analyser);
-      analyser.connect(audioCtx.destination);
       sourceConnected = true;
       if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
     } catch (err) {
@@ -851,7 +866,14 @@ async function requestFolderAccess() {
 }
 
 els.folderFallbackInput.addEventListener("change", async (e) => {
-  const files = Array.from(e.target.files || []).filter(f => AUDIO_EXT.test(f.name));
+  const everything = Array.from(e.target.files || []);
+  state.lyricRefs = new Map();
+  everything.forEach(f => {
+    if (!LYRIC_EXT.test(f.name)) return;
+    const k = lyricKey(f.webkitRelativePath || f.name);
+    if (!state.lyricRefs.has(k) || /\.lrc$/i.test(f.name)) state.lyricRefs.set(k, f);
+  });
+  const files = everything.filter(f => AUDIO_EXT.test(f.name));
   if (!files.length) { toast("No audio files found in that folder."); return; }
   showConnecting("Reading your folder…", "This stays on your device.");
   state.usingFSApi = false;
@@ -912,6 +934,7 @@ async function scanDirectoryHandle(dirHandle, relPath = "") {
   els.storageLabel.textContent = "Scanning your library…";
   setStorageBusy(true);
   const found = [];
+  state.lyricRefs = new Map();
   async function walk(handle, path) {
     for await (const [name, entry] of handle.entries()) {
       const p = path ? `${path}/${name}` : name;
@@ -920,6 +943,9 @@ async function scanDirectoryHandle(dirHandle, relPath = "") {
       } else if (entry.kind === "file" && AUDIO_EXT.test(name)) {
         found.push({ handle: entry, path: p, folder: path || "Library Root" });
         if (found.length % 15 === 0) setConnectingStatus(`Found ${found.length} songs so far…`, "Still searching your folders.", true);
+      } else if (entry.kind === "file" && LYRIC_EXT.test(name)) {
+        const k = lyricKey(p);
+        if (!state.lyricRefs.has(k) || /\.lrc$/i.test(name)) state.lyricRefs.set(k, entry); // .lrc (synced) beats .txt
       }
     }
   }
@@ -970,6 +996,7 @@ async function buildLibraryFromEntries(entries, isFsApi) {
       artist: artist || "Unknown Artist",
       album,
       folder: e.folder,
+      relPath: e.path,      // used to pair the song with a sidecar .lrc/.txt
       ext: (filename.split(".").pop() || "").toLowerCase(),
       size: 0,
       duration: 0,
@@ -1948,6 +1975,8 @@ async function loadAndPlayCurrent() {
   state.objectUrl = URL.createObjectURL(file);
   const myLoadToken = ++audioLoadToken; // guards against a stale play()/error firing after a newer track has already started loading
   audio.src = state.objectUrl;
+  if (window.VaneLyrics) window.VaneLyrics.songChanged();
+  resetBufferedUI(); // otherwise the new track would start with the *previous* song's "fully loaded" bar still showing, until the first progress/loadedmetadata event corrects it
   RageMode.ensureAudioGraph();
   try {
     await audio.play();
@@ -2169,7 +2198,50 @@ audio.addEventListener("timeupdate", () => {
   els.miniProgressFill.style.width = pct + "%";
   els.curTime.textContent = fmtTime(audio.currentTime);
   els.totalTime.textContent = fmtTime(audio.duration);
+  updateBufferedUI(); // cheap enough to run every tick, and "progress" alone fires too sparsely on some browsers to feel live
 });
+
+/* ---------------------------------------------------------------------
+   Buffered/loading indicator — the seek bar shows two variables at
+   once: .seek-fill (solid, on top) is how far PLAYBACK has reached;
+   .seek-buffered (softer, underneath — same for the mini player's
+   .mini-progress-buffered) is how much of the file has actually
+   finished LOADING, which for anything but a tiny file is a real,
+   separate number worth showing rather than just implying "it's all
+   here" the instant a track starts playing.
+   --------------------------------------------------------------------- */
+/** Reads the browser's own record of what's been downloaded/decoded so
+ *  far (audio.buffered — a list of disjoint time ranges, since a seek
+ *  can leave a gap between what was already loaded and what's loading
+ *  now) and reports how far the range covering — or nearest to — the
+ *  playhead actually reaches. Marks the bar "loaded" once that reaches
+ *  effectively the full duration, which turns off the shimmer in favor
+ *  of a quiet steady glow (see .seek-buffered.loaded in style.css). */
+function updateBufferedUI() {
+  if (!audio.duration || !isFinite(audio.duration)) return;
+  const ranges = audio.buffered;
+  let end = 0;
+  for (let i = 0; i < ranges.length; i++) {
+    if (audio.currentTime >= ranges.start(i) && audio.currentTime <= ranges.end(i)) { end = ranges.end(i); break; }
+    end = Math.max(end, ranges.end(i));
+  }
+  const pct = Math.min(100, (end / audio.duration) * 100);
+  const fullyLoaded = pct >= 99.9;
+  if (els.seekBuffered) { els.seekBuffered.style.width = pct + "%"; els.seekBuffered.classList.toggle("loaded", fullyLoaded); }
+  if (els.miniProgressBuffered) els.miniProgressBuffered.style.width = pct + "%";
+}
+/** Called right after a new src is assigned, so the bar doesn't sit at
+ *  the PREVIOUS track's (possibly 100%, possibly "loaded"-glowing)
+ *  width for the split second before the new file's first progress/
+ *  loadedmetadata event arrives to correct it. */
+function resetBufferedUI() {
+  if (els.seekBuffered) { els.seekBuffered.style.width = "0%"; els.seekBuffered.classList.remove("loaded"); }
+  if (els.miniProgressBuffered) els.miniProgressBuffered.style.width = "0%";
+}
+audio.addEventListener("progress", updateBufferedUI);
+audio.addEventListener("loadedmetadata", updateBufferedUI);
+audio.addEventListener("canplaythrough", updateBufferedUI); // browsers that report a single, late "fully buffered" range rather than incremental progress ticks still get an accurate final state here
+
 audio.addEventListener("ended", () => nextSong(true));
 audio.addEventListener("play", () => { state.isPlaying = true; setPlayIcon(true); });
 audio.addEventListener("pause", () => { state.isPlaying = false; setPlayIcon(false); });
@@ -3063,11 +3135,18 @@ function activateSongRow(row) {
 // External playlist inputs (re-rendered each time, so listen via delegation)
 els.contentScroll.addEventListener("keydown", (e) => {
   // .song-row carries role="button" tabindex="0", which only promises
-  // keyboard operability if we actually wire up Enter/Space ourselves —
-  // browsers don't do it for free on non-native buttons. Only fires when
-  // the row itself is focused, not when focus is on one of its nested
-  // action buttons (those already handle their own Enter/Space natively).
-  if ((e.key === "Enter" || e.code === "Space") && e.target.classList.contains("song-row")) {
+  // keyboard operability if we actually wire up Enter ourselves — browsers
+  // don't do it for free on non-native buttons. Only fires when the row
+  // itself is focused, not when focus is on one of its nested action
+  // buttons (those already handle their own Enter natively).
+  //
+  // Enter activates the row (play this song, or in select mode toggle its
+  // checkbox) exactly like a click. Space is deliberately not handled at
+  // all here, in select mode or otherwise: Space belongs to the app-wide
+  // play/pause shortcut (see the window keydown handler below) with no
+  // carve-outs, so it means the same thing everywhere in the app, no
+  // matter what's focused or what mode the list is in.
+  if (e.key === "Enter" && e.target.classList.contains("song-row")) {
     e.preventDefault();
     if (state.selectMode) { toggleRowSelected(e.target.dataset.id); return; }
     activateSongRow(e.target);
@@ -3169,7 +3248,7 @@ els.confirmNewPlaylistBtn.addEventListener("click", async () => {
 els.newPlaylistInput.addEventListener("keydown", (e) => { if (e.key === "Enter") els.confirmNewPlaylistBtn.click(); });
 
 // Mini player
-els.miniPlayer.addEventListener("click", (e) => { if (!e.target.closest("button")) openPlayer(); });
+els.miniPlayer.addEventListener("click", (e) => { if (!e.target.closest("button, .mini-volume")) openPlayer(); });
 els.miniPlayBtn.addEventListener("click", (e) => { e.stopPropagation(); togglePlay(); });
 els.miniPrevBtn.addEventListener("click", (e) => { e.stopPropagation(); prevSong(); });
 els.miniNextBtn.addEventListener("click", (e) => { e.stopPropagation(); nextSong(false); });
@@ -3185,6 +3264,18 @@ els.repeatBtn.addEventListener("click", cycleRepeat);
 els.favBtn.addEventListener("click", () => { const id = state.queue[state.queueIndex]; if (id) toggleFavorite(id); });
 els.addToPlaylistBtn.addEventListener("click", () => { const id = state.queue[state.queueIndex]; if (id) openPlaylistModal(id); });
 els.queueBtn.addEventListener("click", openQueue);
+
+/* Equalizer + Lyrics (eq.js / lyrics.js). Opened from the full player, the
+   sidebar, Settings, or the E / L keys. Settings closes first so the panel
+   isn't fighting the modal for focus. */
+const openEq = (opener) => window.VaneEQ && window.VaneEQ.toggle(opener);
+const openLyrics = (opener) => window.VaneLyrics && window.VaneLyrics.toggle(opener);
+els.eqBtn.addEventListener("click", () => openEq(els.eqBtn));
+els.lyricsBtn.addEventListener("click", () => openLyrics(els.lyricsBtn));
+els.eqSidebarBtn.addEventListener("click", () => openEq(els.eqSidebarBtn));
+els.lyricsSidebarBtn.addEventListener("click", () => openLyrics(els.lyricsSidebarBtn));
+els.settingsEqBtn.addEventListener("click", () => { closeSettings(); openEq(els.settingsBtn); });
+els.settingsLyricsBtn.addEventListener("click", () => { closeSettings(); openLyrics(els.settingsBtn); });
 
 /* Custom album art — pick a photo from device storage for the song
    currently open in the full player. Any resolution/aspect ratio goes
@@ -3286,26 +3377,106 @@ els.rowActionsList.addEventListener("click", (e) => {
   }
 });
 
+/* ---------------------------------------------------------------------
+   Volume control — one controller drives the mini-player slider, the
+   full-player slider, the mute buttons, and the keyboard shortcuts, so
+   they can never disagree. Remembered between visits (not the mute flag).
+   --------------------------------------------------------------------- */
+const volume = createVolumeController(audio, { storageKey: "volume-audio", step: 5 });
+const volUI = {
+  sliders: [$("#volSlider"), $("#miniVolSlider")],
+  buttons: [$("#muteBtn"), $("#miniMuteBtn")],
+  icons: [$("#volIcon"), $("#miniVolIcon")],
+  value: $("#volValue"),
+  groups: [$("#playerVolume"), $("#miniVolume")],
+};
+volume.subscribe((v) => {
+  volUI.sliders.forEach(sl => {
+    sl.value = v.level;
+    sl.style.setProperty("--vol-pct", v.level + "%");
+    sl.setAttribute("aria-valuetext", v.muted ? "Muted" : v.volume + " percent");
+  });
+  volUI.icons.forEach(ic => { ic.innerHTML = volumeIconMarkup(v.level); });
+  volUI.buttons.forEach(b => b.classList.toggle("muted", v.level === 0));
+  volUI.value.textContent = v.muted ? "Muted" : v.volume + "%";
+  volUI.groups.forEach(g => g.classList.toggle("no-volume-slider", !v.supported));
+});
+volUI.sliders.forEach(sl => sl.addEventListener("input", () => volume.set(Number(sl.value))));
+volUI.buttons.forEach(b => b.addEventListener("click", (e) => { e.stopPropagation(); volume.toggleMute(); }));
+function volumeToast() {
+  const v = volume.state;
+  return v.muted ? "🔇 Muted" : v.volume === 0 ? "🔇 Volume 0%" : `🔊 Volume ${v.volume}%`;
+}
+
+/* ---------------------------------------------------------------------
+   Keyboard shortcuts — this map is what Settings → Keyboard Shortcuts
+   shows (catalog: SHORTCUTS.audio in shared.js). Keep the two in sync.
+     Space          play / pause          M          mute / unmute
+     Shift + ↑ / ↓  volume ±5%            S          shuffle on / off
+     ← / →          seek ∓5s              R          repeat off → all → one
+     Shift + ← / →  previous / next song   L          lyrics view
+                                           E          equalizer
+   Plain arrows are deliberately NOT used for volume: they scroll the
+   library list, and the app already reserved Shift+Arrow for track skip.
+   --------------------------------------------------------------------- */
+function isTypingTarget(t) {
+  if (!(t instanceof window.Element)) return false;
+  if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+  if (t.tagName !== "INPUT") return false;
+  return !["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"].includes((t.type || "").toLowerCase());
+}
 window.addEventListener("keydown", (e) => {
-  // Only bother checking what's focused for the keys we actually care
-  // about — cheaper, and avoids ever touching e.target for keys (or
-  // synthetic/edge-case targets) this shortcut has no business near.
-  if (e.code !== "Space" && !((e.code === "ArrowRight" || e.code === "ArrowLeft") && e.shiftKey)) return;
-  // Don't hijack Space/Shift+Arrow when focus is on any control that has
-  // its own native meaning for those keys — text inputs, selects, and
-  // (crucially) buttons/links/anything focusable. A focused <button>
-  // activates on Space; without this check that Space also fired the
-  // global "toggle playback" shortcut and preventDefault() suppressed
-  // the button's own click — so keyboard-focusing the song-options (⋮)
-  // button and pressing Space silently toggled playback instead of
-  // opening the menu.
+  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return; // never steal browser/OS combos (Ctrl+R, Cmd+S…)
   const t = e.target;
-  const interactive = t instanceof window.Element && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
-    t.tagName === "SELECT" || t.tagName === "BUTTON" || t.isContentEditable || t.closest('[role="button"], [tabindex]'));
-  if (interactive) return;
-  if (e.code === "Space") { e.preventDefault(); togglePlay(); }
-  else if (e.code === "ArrowRight") nextSong(false);
-  else if (e.code === "ArrowLeft") prevSong();
+  if (isTypingTarget(t)) return;
+  const key = e.key;
+  const isRange = t instanceof window.Element && t.tagName === "INPUT" && t.type === "range";
+  const isVolSlider = isRange && t.classList.contains("vol-slider");
+
+  // Space — the app-wide play/pause toggle, unconditionally. It has to
+  // keep meaning "play/pause" no matter what state the app is in or what
+  // last had keyboard focus: a settings/playlist/queue sheet open, a
+  // song row still focused from the last click, a button focused after
+  // tabbing through the toolbar, mid-scroll, right after a song
+  // finished — all of it. isTypingTarget (above) is the ONLY carve-out:
+  // if you're actually typing into a text field, Space types a space.
+  // Everywhere else it's play/pause, full stop — no exception for
+  // buttons or links either, same as Space works in every other media
+  // player (YouTube, Spotify, SoundCloud). Nothing upstream of this
+  // handler is allowed to consume Space for its own purpose anymore
+  // (see the contentScroll handler above, which used to and was the
+  // actual bug: focus a song row and Space stopped toggling playback).
+  if (e.code === "Space") {
+    if (e.repeat) return;
+    e.preventDefault(); togglePlay();
+    return;
+  }
+
+  if (key === "ArrowUp" || key === "ArrowDown" || key === "ArrowLeft" || key === "ArrowRight") {
+    if (isRange && !(isVolSlider && e.shiftKey && (key === "ArrowUp" || key === "ArrowDown"))) return; // sliders keep their own arrow keys
+    if ((key === "ArrowLeft" || key === "ArrowRight") && els.themeCarouselOverlay.classList.contains("open")) return; // carousel owns these
+    if (e.shiftKey && (key === "ArrowUp" || key === "ArrowDown")) {
+      e.preventDefault();
+      if (!volume.supported) { toast("Volume is controlled by your device's buttons in this browser.", 2800); return; }
+      volume.nudge(key === "ArrowUp" ? 1 : -1);
+      toast(volumeToast(), 1100);
+    } else if (e.shiftKey && key === "ArrowRight") { if (!e.repeat) nextSong(false); }
+    else if (e.shiftKey && key === "ArrowLeft") { if (!e.repeat) prevSong(); }
+    else if (!e.shiftKey && (key === "ArrowLeft" || key === "ArrowRight")) {
+      if (!audio.src || !isFinite(audio.duration)) return;
+      e.preventDefault();
+      audio.currentTime = Math.max(0, Math.min(audio.duration, audio.currentTime + (key === "ArrowRight" ? 5 : -5)));
+    }
+    return;
+  }
+
+  if (e.shiftKey || e.repeat) return;
+  const k = key.toLowerCase();
+  if (k === "m") { e.preventDefault(); volume.toggleMute(); toast(volumeToast(), 1100); }
+  else if (k === "s") { e.preventDefault(); toggleShuffle(); toast(state.shuffle ? "🔀 Shuffle on" : "Shuffle off", 1100); }
+  else if (k === "l") { e.preventDefault(); openLyrics(); }
+  else if (k === "e") { e.preventDefault(); openEq(); }
+  else if (k === "r") { e.preventDefault(); cycleRepeat(); toast(state.repeat === "one" ? "🔂 Repeat one" : state.repeat === "all" ? "🔁 Repeat all" : "Repeat off", 1100); }
 });
 
 // Escape closes whichever sheet/modal is currently open, innermost first —
@@ -3330,9 +3501,38 @@ window.addEventListener("resize", () => {
 });
 
 /* ---------------------------------------------------------------------
+   Equalizer + Lyrics bridge — the two modules are separate files and this
+   file is a closure, so hand them exactly what they need and nothing more.
+   --------------------------------------------------------------------- */
+function currentSong() { return state.songs.find(s => s.id === state.queue[state.queueIndex]) || null; }
+async function getLyricFileForSong(songId) {
+  const song = state.songs.find(s => s.id === songId);
+  if (!song || !song.relPath) return null;
+  const ref = state.lyricRefs.get(lyricKey(song.relPath));
+  if (!ref) return null;
+  return ref.getFile ? await ref.getFile() : ref;
+}
+window.VaneEQ.attach(audio).then(() => {
+  window.VaneEQ.subscribe((snap) => {
+    els.eqBtn.classList.toggle("active", snap.engaged);
+    els.eqBtn.title = snap.engaged ? "Equalizer — on (E)" : "Equalizer (E)";
+  });
+});
+window.VaneLyrics.init({
+  audio, toast,
+  getSong: currentSong,
+  getFile: getFileForSong,
+  getLyricFile: getLyricFileForSong,
+  art: (song) => resolveArtUrl(song),
+  togglePlay, next: () => nextSong(false), prev: prevSong,
+});
+
+/* ---------------------------------------------------------------------
    Boot
    --------------------------------------------------------------------- */
 async function boot() {
+  renderShortcutList($("#shortcutList"), "audio", $("#shortcutNote"));
+  volume.load();
   await loadUserData();
   if (fsApiSupported()) {
     els.fsApiNote.textContent = "Your browser will remember this folder next time you open the app.";
