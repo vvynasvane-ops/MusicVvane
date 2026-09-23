@@ -568,12 +568,21 @@ function buildUI() {
   root.querySelectorAll(".vq-tabs button").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
   $("#vqSaveOk").addEventListener("click", doSave);
   $("#vqSaveCancel").addEventListener("click", () => UI.el.saveRow.classList.add("hidden"));
-  UI.el.saveName.addEventListener("keydown", (e) => { if (e.key === "Enter") doSave(); else if (e.key === "Escape") { e.stopPropagation(); UI.el.saveRow.classList.add("hidden"); } });
+  UI.el.saveName.addEventListener("keydown", (e) => { if (e.key === "Enter") doSave(); });
   bindCanvas();
   window.addEventListener("resize", () => { if (api.isOpen()) sizeCanvas(); });
-  // Escape closes the EQ before anything underneath (player, lyrics…) reacts
+  // Escape closes the EQ before anything underneath (player, lyrics…) reacts —
+  // captured at the window level so it always wins regardless of what has
+  // focus. One layer first: if the "save a custom preset" row is open,
+  // Escape backs out of just that (keeping the panel itself open), same as
+  // it would for any other in-panel popover — only a second Escape (or one
+  // pressed while the row isn't open) closes the whole panel.
   window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && api.isOpen()) { e.stopImmediatePropagation(); e.preventDefault(); close(); }
+    if (e.key === "Escape" && api.isOpen()) {
+      e.stopImmediatePropagation(); e.preventDefault();
+      if (!UI.el.saveRow.classList.contains("hidden")) { UI.el.saveRow.classList.add("hidden"); UI.el.saveName.blur(); return; }
+      close();
+    }
     else if (e.key === "Tab" && api.isOpen()) trapFocus(e);
   }, true);
 }
@@ -661,7 +670,7 @@ function bindCanvas() {
   c.addEventListener("pointermove", (e) => {
     const r = c.getBoundingClientRect();
     if (UI.drag >= 0) { let db = dbOfY(e.clientY - r.top, r.height); if (Math.abs(db) < 0.6) db = 0; api.setBand(UI.drag, db); }
-    else c.style.cursor = pick(e) >= 0 ? "grab" : "default";
+    else c.classList.toggle("vv-cursor-grab", pick(e) >= 0);
   });
   const end = (e) => { UI.drag = -1; try { c.releasePointerCapture(e.pointerId); } catch (err) {} };
   c.addEventListener("pointerup", end); c.addEventListener("pointercancel", end);
